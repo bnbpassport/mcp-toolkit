@@ -1,0 +1,99 @@
+name: "Build"
+on:
+  workflow_call:
+defaults:
+  run:
+    shell: bash
+env:
+  CI: true
+
+jobs:
+  run-build:
+    name: "Build packages"
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: "pnpm"
+
+      - name: "Clean install dependencies"
+        run: pnpm install --frozen-lockfile
+
+      - name: "Run pnpm build"
+        run: pnpm build
+
+      - name: Setup hosts file
+        run: |
+          grep -E 'container_name:' docker/docker-compose.yml | awk '{print $2}' | while read -r service; do
+            sudo bash -c "echo '127.0.0.1 $service' >> /etc/hosts"
+          done
+          cat /etc/hosts # Verify the entries were added
+
+      - name: "Run pnpm test"
+        env:
+          CREDO_CHEQD_TESTNET_MNEMONIC: ${{ secrets.TESTNET_MNEMONIC }}
+        run: pnpm test
+
+      - name: Upload Playwright report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: playwright-report
+          path: | 
+            playwright-report/
+            test-results/
+          retention-days: 7
+          if-no-files-found: ignore
+
+  build-docker:
+    name: "Build Docker image"
+    runs-on: ubuntu-latest
+    needs: run-build
+    env:
+      IMAGE_NAME: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        id: buildx
+        with:
+          install: true
+          version: latest
+      
+      - name: Configure Docker image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ${{ env.IMAGE_NAME }}
+            ghcr.io/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=raw,value=staging-latest
+            type=sha,format=long
+      
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/amd64
+          load: true
+          target: runner
+          tags: ${{ steps.meta.outputs.tags }}
+          outputs: type=docker,dest=mcp-toolkit-staging.tar
+          cache-from: type=gha
+          cache-to: type=gha,mode=min
+      
+      - name: Upload staging image as an artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mcp-toolkit-staging
+          path: mcp-toolkit-staging.tar
